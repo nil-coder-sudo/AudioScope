@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 頻譜長條圖示：安全區 66dp 置中 -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path android:fillColor="#1F9E6E" android:pathData="M31,62h5v12h-5z" />
+    <path android:fillColor="#3FD68D" android:pathData="M38,50h5v24h-5z" />
+    <path android:fillColor="#4CC2FF" android:pathData="M45,36h5v38h-5z" />
+    <path android:fillColor="#4CC2FF" android:pathData="M52,44h5v30h-5z" />
+    <path android:fillColor="#F5D547" android:pathData="M59,32h5v42h-5z" />
+    <path android:fillColor="#FF9F43" android:pathData="M66,48h5v26h-5z" />
+    <path android:fillColor="#FF5C7A" android:pathData="M73,58h5v16h-5z" />
+    <path android:strokeColor="#D7DDE8" android:strokeWidth="1.5"
+        android:pathData="M30,40 Q40,28 50,34 T70,30 T80,40" />
+</vector>
