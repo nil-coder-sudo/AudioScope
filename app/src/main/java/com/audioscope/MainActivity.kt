@@ -796,8 +796,10 @@ class MainActivity : Activity() {
             timeText.text = "● LIVE ${Fmt.n(sr / 1000.0, 1)} kHz"
         }
         val cur = src.cursor()
-        val advanced = cur != lastCur
         lastCur = cur
+        // 播放位置／收音計數是一塊一塊更新的（約 10–40 ms），比螢幕刷新慢，
+        // 所以用「正在播放或收音」判斷是否在跑，而不是看這一格位置有沒有變。
+        val advanced = src === live || p?.playing == true
 
         val need = blk[0].size
         if (blk.size != src.channelCount) return applyDsp()
