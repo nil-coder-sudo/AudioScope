@@ -40,6 +40,12 @@ import kotlin.math.sqrt
 
 class MainActivity : Activity() {
     private companion object {
+        /** 頻譜圖換聲道等次要工作用的單一背景執行緒。 */
+        val bg: java.util.concurrent.ExecutorService =
+            java.util.concurrent.Executors.newSingleThreadExecutor { r -> Thread(r, "AudioScope-bg").apply { isDaemon = true } }
+
+        /** 每個程序只清一次殘留暫存檔（那時一定沒有解碼在進行）。 */
+        @Volatile var tempCleaned = false
         const val REQ_OPEN = 11
         const val REQ_MIC = 12
         val FFT_SIZES = arrayOf("1024", "2048", "4096", "8192", "16384", "32768")
@@ -136,6 +142,11 @@ class MainActivity : Activity() {
         window.navigationBarColor = Pal.BG
         volumeControlStream = android.media.AudioManager.STREAM_MUSIC
         prefs = getSharedPreferences("audioscope", Context.MODE_PRIVATE)
+        if (!tempCleaned) {
+            tempCleaned = true
+            val app = applicationContext
+            bg.execute { AudioDecoder.cleanStaleTempFiles(app) }
+        }
         loadPrefs()
         setContentView(buildUi())
         applyDsp()
@@ -458,8 +469,10 @@ class MainActivity : Activity() {
                 if (g != gen) throw CancellationException()
             }
             try {
-                // 等上一首的工作真的結束，確保記憶體裡不會同時有兩首歌
+                // 等上一首的工作真的結束，確保記憶體裡不會同時有兩首歌：
+                // 解碼／分析執行緒用 join；背景執行緒（頻譜圖換聲道）送一個空工作進去等它排到
                 prev?.join()
+                bg.submit {}.get()
                 check()
                 var lastPct = -1
                 val (a, m) = AudioDecoder.decode(this, uri) { p ->
@@ -510,7 +523,9 @@ class MainActivity : Activity() {
         val g = gen
         val job = ++specJob
         specRead.text = "計算 ${Analyzer.SPEC_MODES[mode]} 頻譜圖…"
-        Thread {
+        // 跑在單一背景執行緒：同時最多一個；換檔時 load() 會等它結束
+        bg.execute {
+            if (g != gen || job != specJob) return@execute
             try {
                 val sp = Analyzer.spectrogram(a, mode, { pct ->
                     if (g != gen || job != specJob) throw CancellationException()
@@ -527,7 +542,7 @@ class MainActivity : Activity() {
             } catch (_: OutOfMemoryError) {
                 ui.post { toast("記憶體不足，無法計算這個聲道") }
             }
-        }.start()
+        }
     }
 
     private fun onDecoded(a: DecodedAudio, m: FileMeta, env: Envelope) {

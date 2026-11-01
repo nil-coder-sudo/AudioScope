@@ -18,8 +18,16 @@ fun secret(env: String, prop: String): String? = System.getenv(env)?.takeIf { it
 
 val releaseStore = secret("KEYSTORE_FILE", "storeFile")?.let { rootProject.file(it) }?.takeIf { it.exists() }
 
-// 版本：CI 用執行編號當 versionCode（只增不減，才能覆蓋安裝），tag 當 versionName
-val runNumber = System.getenv("GITHUB_RUN_NUMBER")?.toIntOrNull() ?: 1
+// 版本：versionCode = 100 + git commit 數。
+// 同一個 commit 不論在 CI 或本機編譯都得到同一個號碼，而且只增不減，才能覆蓋安裝。
+// （+100 是為了高於舊版用 CI 執行編號產生的版號，已安裝的舊版仍可直接升級。）
+// CI 需要完整歷史（checkout 的 fetch-depth: 0）；拿不到 git 資訊時退回 1。
+val commitCount: Int = runCatching {
+    providers.exec {
+        commandLine("git", "rev-list", "--count", "HEAD")
+        isIgnoreExitValue = true
+    }.standardOutput.asText.get().trim().toInt()
+}.getOrDefault(0)
 val tagName = System.getenv("GITHUB_REF_NAME")?.takeIf { System.getenv("GITHUB_REF_TYPE") == "tag" }
 
 android {
@@ -30,8 +38,8 @@ android {
         applicationId = "com.audioscope"
         minSdk = 26
         targetSdk = 34
-        versionCode = runNumber
-        versionName = tagName?.removePrefix("v") ?: "1.1.$runNumber"
+        versionCode = if (commitCount > 0) 100 + commitCount else 1
+        versionName = tagName?.removePrefix("v") ?: "1.1.$commitCount"
     }
 
     signingConfigs {

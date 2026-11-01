@@ -76,6 +76,18 @@ class FileSource(private val audio: DecodedAudio, private val player: Player) : 
 //  解碼結果先寫進暫存檔，知道確切長度後才配置陣列，記憶體峰值＝最終大小。
 // ════════════════════════════════════════════════════════════════════
 object AudioDecoder {
+    private const val TMP_PREFIX = "decode"
+    private const val TMP_SUFFIX = ".f32"
+
+    /**
+     * 刪掉上次殘留的解碼暫存檔（例如分析途中 App 被系統終止）。
+     * 只在程序剛啟動、還沒有任何解碼在跑時呼叫。
+     */
+    fun cleanStaleTempFiles(ctx: Context) {
+        ctx.cacheDir.listFiles { f -> f.isFile && f.name.startsWith(TMP_PREFIX) && f.name.endsWith(TMP_SUFFIX) }
+            ?.forEach { it.delete() }
+    }
+
     private val CODECS = mapOf(
         "audio/mpeg" to ("MP3（MPEG Layer III）" to false),
         "audio/mp4a-latm" to ("AAC" to false),
@@ -291,7 +303,7 @@ object AudioDecoder {
         tags: List<Pair<String, String>>, progress: (Float) -> Unit,
     ): Pair<DecodedAudio, FileMeta> {
         val ex = MediaExtractor()
-        val tmp = File.createTempFile("decode", ".f32", ctx.cacheDir)
+        val tmp = File.createTempFile(TMP_PREFIX, TMP_SUFFIX, ctx.cacheDir)
         var codec: MediaCodec? = null
         try {
             ex.setDataSource(ctx, uri, null)
@@ -464,15 +476,12 @@ object AudioDecoder {
         }
         when (enc) {
             AudioFormat.ENCODING_PCM_FLOAT -> {
-                // 已是 float32 LE：整塊複製
+                // 已是 float32 LE：整塊複製。只處理完整的 4 bytes；
+                // stage 只會被寫入整數個 float，所以清空前剩餘空間一定 ≥ 4，迴圈必定前進。
                 n = (bb.remaining() / 4).toLong()
-                while (bb.hasRemaining()) {
-                    if (!stage.hasRemaining()) flush()
+                while (bb.remaining() >= 4) {
+                    if (stage.remaining() < 4) flush()
                     val k = min(stage.remaining(), bb.remaining()) and 3.inv()
-                    if (k == 0) {
-                        flush()
-                        continue
-                    }
                     val lim = bb.limit()
                     bb.limit(bb.position() + k)
                     stage.put(bb)
