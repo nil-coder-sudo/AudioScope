@@ -1,4 +1,4 @@
-# AudioScope（Android 版）
+# AudioScope（Android）
 
 專業音訊分析 App：即時頻譜、即時瀑布圖、整首頻譜圖（找隱藏圖像）、電平、EBU R128 響度、真峰值、相位、向量示波器，以及完整的檔案資訊。
 
