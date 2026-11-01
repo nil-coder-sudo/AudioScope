@@ -1,0 +1,19 @@
+# Gradle / Android Studio
+.gradle/
+build/
+app/build/
+local.properties
+.idea/
+*.iml
+captures/
+.externalNativeBuild/
+.cxx/
+
+# 簽章金鑰：絕對不要提交
+*.jks
+*.keystore
+keystore.properties
+
+# 系統
+.DS_Store
+Thumbs.db

@@ -1,3 +1,5 @@
+import java.util.Properties
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
@@ -7,7 +9,8 @@ plugins {
 // CI 從 GitHub Secrets 解出 keystore，並透過環境變數傳進來；
 // 本機編譯可在專案根目錄放 keystore.properties（已列入 .gitignore）。
 // 兩者都沒有時退回 debug 金鑰（每台機器不同，無法覆蓋安裝，只適合測試）。
-val localProps = java.util.Properties().apply {
+// 注意：Gradle Kotlin 腳本裡的 `java` 是 java { } 擴充區塊，不能寫成 java.util.Properties，要用 import。
+val localProps = Properties().apply {
     val f = rootProject.file("keystore.properties")
     if (f.exists()) f.inputStream().use { load(it) }
 }

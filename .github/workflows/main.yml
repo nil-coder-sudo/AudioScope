@@ -2,11 +2,20 @@ name: Build APK
 
 on:
   push:
+    branches: ["**"]
+  pull_request:
+  release:
+    types: [published]
   workflow_dispatch:
+
+permissions:
+  contents: write # 把 APK 附加到 Release 需要
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    env:
+      HAS_KEYSTORE: ${{ secrets.KEYSTORE_BASE64 != '' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -15,20 +24,51 @@ jobs:
           distribution: temurin
           java-version: "17"
 
+      # GitHub 的 Ubuntu 機器已內建 Android SDK，只需確認授權已接受
       - name: Accept Android SDK licenses
         run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
 
       - uses: gradle/actions/setup-gradle@v4
 
-      - name: Build release APK
+      - name: Unit tests
         run: |
           chmod +x gradlew
-          ./gradlew assembleRelease --no-daemon --stacktrace
+          ./gradlew testDebugUnitTest --no-daemon
+
+      - name: Decode signing keystore
+        if: env.HAS_KEYSTORE == 'true'
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+        run: |
+          echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.jks"
+          echo "KEYSTORE_FILE=$RUNNER_TEMP/release.jks" >> "$GITHUB_ENV"
+
+      - name: Warn about debug signing
+        if: env.HAS_KEYSTORE != 'true'
+        run: echo "::warning::沒有設定 KEYSTORE_BASE64，這次用臨時 debug 金鑰簽章，新版將無法覆蓋安裝。請看 README 的「固定簽章」。"
+
+      - name: Build release APK
+        env:
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: ./gradlew assembleRelease --no-daemon --stacktrace
 
       - name: Rename APK
         run: cp app/build/outputs/apk/release/app-release.apk AudioScope.apk
+
+      - name: Remove keystore
+        if: always()
+        run: rm -f "$RUNNER_TEMP/release.jks"
 
       - uses: actions/upload-artifact@v4
         with:
           name: AudioScope-apk
           path: AudioScope.apk
+
+      # 發佈 Release 時把 APK 附上去：公開下載、不用登入、不會過期
+      - name: Attach APK to release
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: AudioScope.apk
