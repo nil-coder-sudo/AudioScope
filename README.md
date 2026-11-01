@@ -94,6 +94,12 @@ DSP 與分析核心是純 Kotlin，可以在電腦上跑單元測試（CI 每次
 
 測試涵蓋 FFT、音名、BS.1770 響度（與 pyloudnorm 對照）、串流響度與離線結果一致、5.1 聲道加權與 LFE 排除、真峰值的取樣間峰值、Side 聲道頻譜圖、BPM、縮混不削波。
 
+## 版本號
+
+`versionCode` = 100 + git commit 數。同一個 commit 不論在 CI 或本機編譯，版號都一樣，而且只增不減。
+
+本機編出來的 APK 要能覆蓋安裝 CI 版，還需要用**同一把金鑰**簽章，也就是要先建立上面說的 `keystore.properties`；沒有的話會用 debug 金鑰簽，只能先解除安裝再裝。
+
 ## 用 Android Studio 編譯
 
 用 Android Studio 開啟這個資料夾，等 Gradle 同步完成，再按 ▶ Run，或選 Build → Build APK(s)。

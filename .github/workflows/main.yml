@@ -18,6 +18,8 @@ jobs:
       HAS_KEYSTORE: ${{ secrets.KEYSTORE_BASE64 != '' }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # versionCode 用 git commit 數，需要完整歷史
 
       - uses: actions/setup-java@v4
         with:
