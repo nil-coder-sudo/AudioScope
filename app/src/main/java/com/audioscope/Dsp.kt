@@ -147,13 +147,20 @@ object Loudness {
 
     fun lufs(z: Double): Double = if (z > 0) -0.691 + 10 * log10(z) else Double.NEGATIVE_INFINITY
 
-    /** 每 100 ms 一段的 K 加權能量總和（各聲道相加）。回傳 (能量, 每段樣本數)。 */
-    fun segmentEnergies(chs: Array<FloatArray>, fs: Int): Pair<DoubleArray, Int> {
+    /**
+     * 每 100 ms 一段的 K 加權能量（各聲道乘上 BS.1770 權重後相加）。回傳 (能量, 每段樣本數)。
+     * tick 每處理約 100 萬個樣本呼叫一次，可在裡面丟例外來取消。
+     */
+    fun segmentEnergies(
+        chs: Array<FloatArray>, fs: Int, weights: DoubleArray, tick: () -> Unit = {},
+    ): Pair<DoubleArray, Int> {
         val h = max(1, (0.1 * fs).roundToInt())
         val n = chs[0].size
         val nseg = n / h
         val e = DoubleArray(nseg)
-        for (ch in chs) {
+        for ((c, ch) in chs.withIndex()) {
+            val w = weights[c]
+            if (w == 0.0) continue
             val f = kFilters(fs.toDouble())
             var s = 0
             var acc = 0.0
@@ -162,10 +169,11 @@ object Loudness {
                 val y = f[1].p(f[0].p(ch[i].toDouble()))
                 acc += y * y
                 if (++cnt == h) {
-                    e[s++] += acc
+                    e[s++] += w * acc
                     acc = 0.0
                     cnt = 0
                 }
+                if (i and 0xFFFFF == 0) tick()
             }
         }
         return e to h
@@ -197,22 +205,65 @@ object Loudness {
         return percentile(v, 95.0) - percentile(v, 10.0)
     }
 
-    /** 即時用：濾 blk 最後 len 個樣本，回傳 [zM(最後 mLen), zS(全部)]。 */
-    fun liveZ(blk: Array<FloatArray>, len: Int, fs: Int, mLen: Int): DoubleArray {
-        var sS = 0.0
-        var sM = 0.0
-        for (ch in blk) {
-            val f = kFilters(fs.toDouble())
-            val start = ch.size - len
-            for (i in 0 until len) {
-                val y = f[1].p(f[0].p(ch[start + i].toDouble()))
-                val e = y * y
-                sS += e
-                if (i >= len - mLen) sM += e
+}
+
+/**
+ * 串流式響度表（EBU R128）：濾波器狀態持續保留，每格只處理新進來的樣本。
+ * 以 100 ms 為一段累積，瞬時 M = 最近 4 段、短期 S = 最近 30 段；
+ * 每完成一段就產生一個 400 ms（75% 重疊）區塊，供整合響度做門限。
+ */
+class LoudnessMeter(private val fs: Int, private val weights: DoubleArray) {
+    private val segLen = max(1, (0.1 * fs).roundToInt())
+    private var filters = Array(weights.size) { Loudness.kFilters(fs.toDouble()) }
+    private val seg = DoubleArray(30)
+    private var segN = 0L
+    private var acc = 0.0
+    private var cnt = 0
+    val blocks = ArrayList<Double>()
+
+    fun reset(clearIntegrated: Boolean) {
+        filters = Array(weights.size) { Loudness.kFilters(fs.toDouble()) }
+        segN = 0
+        acc = 0.0
+        cnt = 0
+        if (clearIntegrated) blocks.clear()
+    }
+
+    /** 推入 chs[c][off until off+len]。 */
+    fun push(chs: Array<FloatArray>, off: Int, len: Int) {
+        val nch = min(chs.size, weights.size)
+        for (i in off until off + len) {
+            var e = 0.0
+            for (c in 0 until nch) {
+                val w = weights[c]
+                if (w == 0.0) continue
+                val f = filters[c]
+                val y = f[1].p(f[0].p(chs[c][i].toDouble()))
+                e += w * y * y
+            }
+            acc += e
+            if (++cnt == segLen) {
+                seg[(segN % 30).toInt()] = acc / segLen
+                segN++
+                acc = 0.0
+                cnt = 0
+                if (segN >= 4) blocks.add(mean(4))
             }
         }
-        return doubleArrayOf(sM / mLen, sS / len)
     }
+
+    private fun mean(k: Int): Double {
+        var s = 0.0
+        for (j in 1..k) s += seg[((segN - j) % 30).toInt()]
+        return s / k
+    }
+
+    fun momentary(): Double = if (segN >= 4) Loudness.lufs(mean(4)) else Double.NEGATIVE_INFINITY
+
+    /** 短期響度；不滿 3 秒時用目前已有的長度。 */
+    fun shortTerm(): Double = if (segN >= 4) Loudness.lufs(mean(min(segN, 30L).toInt())) else Double.NEGATIVE_INFINITY
+
+    fun integrated(): Double = Loudness.integrated(blocks)
 }
 
 fun percentile(sorted: List<Double>, p: Double): Double {
@@ -241,7 +292,7 @@ object TruePeak {
         Array(P) { p -> FloatArray(Q) { k -> (full[k * P + p] * scale).toFloat() } }
     }
 
-    fun of(x: FloatArray): Float {
+    fun of(x: FloatArray, tick: () -> Unit = {}): Float {
         var peak = 0f
         for (v in x) {
             val a = abs(v)
@@ -252,6 +303,7 @@ object TruePeak {
         var best = peak
         // 內插點落在 x[m-8] 與 x[m-7] 之間（群延遲 7.875 樣本）
         for (m in Q - 1 until x.size) {
+            if (m and 0xFFFFF == 0) tick()
             if (abs(x[m - 8]) < thr && abs(x[m - 7]) < thr) continue
             for (p in 0 until P) {
                 val hp = h[p]

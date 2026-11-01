@@ -13,14 +13,22 @@ import android.os.Looper
 import android.view.GestureDetector
 import android.view.MotionEvent
 import android.view.ScaleGestureDetector
+import java.util.concurrent.Executors
 import kotlin.math.max
 import kotlin.math.min
 
 /**
  * 整首歌的頻譜圖。
  * 兩指縮放（水平、垂直各自）、單指拖曳平移、點一下跳到該時間、點兩下還原。
+ *
+ * 上色在單一背景執行緒進行：同一時間只跑一個工作，拖動滑桿時的多個請求會合併成最新的一個；
+ * 像素陣列與點陣圖重複使用，只有換頻率刻度或換檔時才重新配置。
  */
 class SpectrogramView(ctx: Context) : PlotView(ctx) {
+    private companion object {
+        val worker = Executors.newSingleThreadExecutor { r -> Thread(r, "AudioScope-spec").apply { isDaemon = true } }
+    }
+
     var onSeek: ((Double) -> Unit)? = null
     var onReadout: ((String) -> Unit)? = null
     var lo = -110f
@@ -32,13 +40,16 @@ class SpectrogramView(ctx: Context) : PlotView(ctx) {
     private var lutName = "inferno"
 
     private var spec: SpecData? = null
-    private var mappedQ: ByteArray? = null // 每個像素的量化 dB（依頻率刻度重新映射）
+    private var mappedQ: ByteArray? = null // 每個像素的量化 dB（已依頻率刻度映射，最上面一列是最高頻）
+    private var mappedFor: SpecData? = null
+    private var mappedLog = false
     private var bmp: Bitmap? = null
     private var pixels = IntArray(0)
     private var bw = 0
     private var bh = 0
     private var position = 0.0
-    private var building = 0
+    private var busy = false
+    private var dirty = false
     private val main = Handler(Looper.getMainLooper())
 
     // 可視範圍（0..1）；y：0＝最低頻，1＝最高頻
@@ -60,12 +71,19 @@ class SpectrogramView(ctx: Context) : PlotView(ctx) {
         invalidate()
     }
 
-    fun setSpec(s: SpecData?) {
+    /** keepView：換聲道時保留目前的縮放位置。 */
+    fun setSpec(s: SpecData?, keepView: Boolean = false) {
+        if (s === spec) return
         spec = s
-        mappedQ = null
-        bmp = null
-        vx0 = 0f; vx1 = 1f; vy0 = 0f; vy1 = 1f
-        rebuild(true)
+        if (s == null) {
+            bmp = null
+            mappedQ = null
+            mappedFor = null
+        }
+        if (!keepView) {
+            vx0 = 0f; vx1 = 1f; vy0 = 0f; vy1 = 1f
+        }
+        request()
     }
 
     fun setPosition(p: Double) {
@@ -76,19 +94,18 @@ class SpectrogramView(ctx: Context) : PlotView(ctx) {
     fun setLevels(lo: Float, hi: Float) {
         this.lo = lo
         this.hi = max(hi, lo + 5f)
-        rebuild(false)
+        request()
     }
 
     fun setLog(log: Boolean) {
         if (log == logScale) return
         logScale = log
-        mappedQ = null
-        rebuild(true)
+        request()
     }
 
     fun setColormap(name: String) {
         lutName = name
-        rebuild(false)
+        request()
     }
 
     /** 依直方圖取 20% 與 99.8% 百分位當作顯示範圍，回傳 (lo, hi)。 */
@@ -118,54 +135,83 @@ class SpectrogramView(ctx: Context) : PlotView(ctx) {
         return lo to hi
     }
 
-    private fun rebuild(remap: Boolean) {
+    /** 要求重畫；正在算時只記下「需要再算一次」，算完會用最新參數補跑。 */
+    private fun request() {
+        if (busy) {
+            dirty = true
+            return
+        }
+        launch()
+    }
+
+    private fun launch() {
         val s = spec
+        dirty = false
         if (s == null) {
             invalidate()
             return
         }
-        val my = ++building
+        busy = true
         val log = logScale
         val l = lo
         val h = hi
         val lut = Colormaps.lut(lutName)
-        val oldMapped = if (remap) null else mappedQ
-        Thread {
-            val w = s.frames
-            val hh = if (log) 1024 else min(s.bins, 1024)
-            val mapped = oldMapped ?: ByteArray(w * hh).also { out ->
-                val fMax = s.bins.minus(1) * s.binHz
-                val mp = FreqMapper(s.binHz, s.bins, hh, if (log) 20.0 else 0.0, fMax, log)
-                val col = FloatArray(s.bins)
-                val res = FloatArray(hh)
-                for (f in 0 until w) {
-                    val base = f * s.bins
-                    for (k in 0 until s.bins) col[k] = (s.q[base + k].toInt() and 0xff).toFloat()
-                    mp.map(col, res)
-                    for (r in 0 until hh) out[(hh - 1 - r) * w + f] = res[r].toInt().coerceIn(0, 255).toByte()
+        val reuseMapped = if (mappedFor === s && mappedLog == log) mappedQ else null
+        val reusePx = pixels
+        worker.execute {
+            var mapped: ByteArray? = null
+            var px: IntArray? = null
+            var w = 0
+            var hh = 0
+            try {
+                w = s.frames
+                hh = if (log) 1024 else min(s.bins, 1024)
+                mapped = reuseMapped ?: mapFreq(s, log, w, hh)
+                val m = mapped
+                val p = if (reusePx.size == m.size) reusePx else IntArray(m.size)
+                // 256 個量化值 → 顏色，整張圖只要查表
+                val qLut = IntArray(256) { q ->
+                    lut[((SpecData.dequant(q) - l) / (h - l) * 255f).toInt().coerceIn(0, 255)]
                 }
+                for (i in m.indices) p[i] = qLut[m[i].toInt() and 0xff]
+                px = p
+            } catch (_: OutOfMemoryError) {
             }
-            // 量化值 → 顏色的對照表
-            val qLut = IntArray(256) { q ->
-                val db = SpecData.dequant(q)
-                lut[((db - l) / (h - l) * 255f).toInt().coerceIn(0, 255)]
-            }
-            val px = IntArray(w * hh)
-            for (i in px.indices) px[i] = qLut[mapped[i].toInt() and 0xff]
             main.post {
-                if (my != building) return@post
-                mappedQ = mapped
-                if (bmp == null || bw != w || bh != hh) {
-                    bmp?.recycle()
-                    bmp = Bitmap.createBitmap(w, hh, Bitmap.Config.ARGB_8888)
-                    bw = w
-                    bh = hh
+                busy = false
+                val m = mapped
+                val p = px
+                if (spec === s && m != null && p != null) {
+                    mappedQ = m
+                    mappedFor = s
+                    mappedLog = log
+                    pixels = p
+                    if (bmp == null || bw != w || bh != hh) {
+                        bmp = Bitmap.createBitmap(w, hh, Bitmap.Config.ARGB_8888)
+                        bw = w
+                        bh = hh
+                    }
+                    bmp?.setPixels(p, 0, w, 0, 0, w, hh)
+                    invalidate()
                 }
-                pixels = px
-                bmp?.setPixels(px, 0, w, 0, 0, w, hh)
-                invalidate()
+                if (dirty || spec !== s || logScale != log) launch()
             }
-        }.start()
+        }
+    }
+
+    private fun mapFreq(s: SpecData, log: Boolean, w: Int, hh: Int): ByteArray {
+        val out = ByteArray(w * hh)
+        val fMax = (s.bins - 1) * s.binHz
+        val mp = FreqMapper(s.binHz, s.bins, hh, if (log) 20.0 else 0.0, fMax, log)
+        val col = FloatArray(s.bins)
+        val res = FloatArray(hh)
+        for (f in 0 until w) {
+            val base = f * s.bins
+            for (k in 0 until s.bins) col[k] = (s.q[base + k].toInt() and 0xff).toFloat()
+            mp.map(col, res)
+            for (r in 0 until hh) out[(hh - 1 - r) * w + f] = res[r].toInt().coerceIn(0, 255).toByte()
+        }
+        return out
     }
 
     private fun fMax(): Double = spec?.let { (it.bins - 1) * it.binHz } ?: 24000.0
@@ -176,9 +222,9 @@ class SpectrogramView(ctx: Context) : PlotView(ctx) {
         c.drawColor(Pal.PANEL)
         val b = bmp
         val s = spec
-        if (b == null || s == null) {
-            c.drawText(hint, width / 2f, height / 2f, hintPaint)
-            return
+        if (b == null || s == null || mappedLog != logScale) {
+            c.drawText(if (s == null) hint else "繪製中…", width / 2f, height / 2f, hintPaint)
+            if (b == null || s == null) return
         }
         src.set(
             (vx0 * bw).toInt(), ((1 - vy1) * bh).toInt(),
@@ -186,7 +232,7 @@ class SpectrogramView(ctx: Context) : PlotView(ctx) {
         )
         dst.set(plot)
         bmpPaint.isFilterBitmap = src.width() > plot.width()
-        c.drawBitmap(b, src, dst, bmpPaint)
+        if (mappedLog == logScale) c.drawBitmap(b, src, dst, bmpPaint)
 
         // 時間軸
         val d = dur()

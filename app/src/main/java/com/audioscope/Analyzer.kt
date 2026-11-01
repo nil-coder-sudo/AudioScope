@@ -14,10 +14,14 @@ import kotlin.math.sqrt
 // ════════════════════════════════════════════════════════════════════
 //  資料結構（純 Kotlin，可在電腦上測試）
 // ════════════════════════════════════════════════════════════════════
-class DecodedAudio(val sampleRate: Int, val channels: Array<FloatArray>) {
+class DecodedAudio(val sampleRate: Int, val channels: Array<FloatArray>, channelMask: Int = 0) {
     val frames: Int get() = channels[0].size
     val channelCount: Int get() = channels.size
     val duration: Double get() = frames.toDouble() / sampleRate
+    val channelMask: Int = Layout.mask(channels.size, channelMask)
+    val names: Array<String> get() = Layout.names(channelCount, channelMask)
+    val loudnessWeights: DoubleArray get() = Layout.loudnessWeights(channelCount, channelMask)
+    val mixWeights: FloatArray get() = Layout.mixWeights(channelCount, channelMask)
 }
 
 class FileMeta(
@@ -79,10 +83,63 @@ object Analyzer {
     private val KS_MAJOR = doubleArrayOf(6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88)
     private val KS_MINOR = doubleArrayOf(6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17)
 
-    fun channelNames(ch: Int): Array<String> = when (ch) {
-        1 -> arrayOf("Mono")
-        2 -> arrayOf("L", "R")
-        else -> Array(ch) { "Ch${it + 1}" }
+    fun channelNames(ch: Int, mask: Int = 0): Array<String> = Layout.names(ch, mask)
+
+    /** 頻譜圖可用的聲道模式。 */
+    val SPEC_MODES = arrayOf("混合", "左 L", "右 R", "側 Side")
+
+    /** 依模式把 [start, start+n) 的樣本乘窗寫進 buf（超出結尾補 0）。 */
+    fun fillMode(a: DecodedAudio, mode: Int, mixW: FloatArray, start: Int, buf: FloatArray, win: FloatArray) {
+        val chs = a.channels
+        val n = buf.size
+        val end = min(n, a.frames - start).coerceAtLeast(0)
+        val m = if (chs.size < 2 && mode != 0) 0 else mode
+        when (m) {
+            1 -> { val l = chs[0]; for (i in 0 until end) buf[i] = l[start + i] * win[i] }
+            2 -> { val r = chs[1]; for (i in 0 until end) buf[i] = r[start + i] * win[i] }
+            3 -> {
+                val l = chs[0]
+                val r = chs[1]
+                for (i in 0 until end) buf[i] = (l[start + i] - r[start + i]) * 0.5f * win[i]
+            }
+            else -> for (i in 0 until end) {
+                var v = 0f
+                for (c in chs.indices) v += chs[c][start + i] * mixW[c]
+                buf[i] = v * win[i]
+            }
+        }
+        for (i in end until n) buf[i] = 0f
+    }
+
+    /**
+     * 整首 STFT → 量化頻譜圖。約 3000 個時間格。
+     * onFrame 拿到每一格的線性幅度（給整體頻譜統計用）。
+     */
+    fun spectrogram(
+        a: DecodedAudio, mode: Int, progress: (Int) -> Unit, onFrame: ((FloatArray) -> Unit)? = null,
+    ): SpecData {
+        val sr = a.sampleRate
+        val n = a.frames
+        val nfft = if (sr > 96000) 8192 else 4096
+        val hop = max(nfft / 4, ceil(max(1, n - nfft) / 3000.0).toInt())
+        val nFrames = if (n <= nfft) 1 else 1 + (n - nfft) / hop
+        val fft = Fft(nfft)
+        val win = Windows.make("Hann", nfft)
+        val norm = 2.0 / win.sum()
+        val bins = nfft / 2 + 1
+        val buf = FloatArray(nfft)
+        val mag = FloatArray(bins)
+        val q = ByteArray(nFrames * bins)
+        val mixW = a.mixWeights
+        for (fr in 0 until nFrames) {
+            fillMode(a, mode, mixW, fr * hop, buf, win)
+            fft.magnitude(buf, mag)
+            val base = fr * bins
+            for (k in 0 until bins) q[base + k] = SpecData.quant(20 * log10(mag[k] * norm + 1e-10))
+            onFrame?.invoke(mag)
+            if (fr % 64 == 0) progress(100 * fr / nFrames)
+        }
+        return SpecData(q, nFrames, bins, sr.toDouble() / nfft, hop.toDouble() / sr, nfft / 2.0 / sr, a.duration)
     }
 
     fun envelope(a: DecodedAudio, buckets: Int = 1200): Envelope {
@@ -92,7 +149,7 @@ object Analyzer {
         val mx = FloatArray(b)
         val rms = FloatArray(b)
         val chs = a.channels
-        val nch = chs.size
+        val mixW = a.mixWeights
         for (i in 0 until b) {
             val s = (i.toLong() * n / b).toInt()
             val e = max(s + 1, ((i + 1).toLong() * n / b).toInt()).coerceAtMost(n)
@@ -101,8 +158,7 @@ object Analyzer {
             var acc = 0.0
             for (j in s until e) {
                 var v = 0f
-                for (c in chs) v += c[j]
-                v /= nch
+                for (c in chs.indices) v += chs[c][j] * mixW[c]
                 if (v < lo) lo = v
                 if (v > hi) hi = v
                 acc += v.toDouble() * v
@@ -126,7 +182,7 @@ object Analyzer {
         s.add("解碼輸出", "${m.decodedBits} bit")
         s.add("取樣率", "${Fmt.i(sr.toLong())} Hz")
         s.add("Nyquist 頻率", "${Fmt.i((sr / 2).toLong())} Hz")
-        s.add("聲道數", "${a.channelCount}（${channelNames(a.channelCount).joinToString(" / ")}）")
+        s.add("聲道數", "${a.channelCount}（${a.names.joinToString(" / ")}）")
         s.add("總樣本數", "${Fmt.i(a.frames.toLong())} / 聲道")
         s.add("長度", "${Fmt.time(a.duration)}（${Fmt.n(a.duration, 3)} 秒）")
         if (m.bitrate > 0) s.add("編碼位元率", "${Fmt.n(m.bitrate / 1000.0, 0)} kbps")
@@ -142,13 +198,14 @@ object Analyzer {
         val nch = chs.size
         val n = a.frames
         val dur = a.duration
-        val names = channelNames(nch)
+        val names = a.names
+        val mixW = a.mixWeights
         val secs = ArrayList<Section>()
         secs.add(quick(a, meta))
         fun mono(i: Int): Float {
             var s = 0f
-            for (c in chs) s += c[i]
-            return s / nch
+            for (c in 0 until nch) s += chs[c][i] * mixW[c]
+            return s
         }
 
         // ── 電平 ──
@@ -188,7 +245,7 @@ object Analyzer {
         val tps = DoubleArray(nch)
         for (c in 0 until nch) {
             progress(6 + 14 * c / nch, "計算真峰值（4× 超取樣）")
-            tps[c] = TruePeak.of(chs[c]).toDouble()
+            tps[c] = TruePeak.of(chs[c]) { progress(6 + 14 * c / nch, "計算真峰值（4× 超取樣）") }.toDouble()
         }
         val lv = Section("電平")
         for (c in 0 until nch) {
@@ -204,7 +261,7 @@ object Analyzer {
 
         // ── 響度 ──
         progress(22, "計算響度（BS.1770 / EBU R128）")
-        val (seg, h) = Loudness.segmentEnergies(chs, sr)
+        val (seg, h) = Loudness.segmentEnergies(chs, sr, a.loudnessWeights) { progress(22, "計算響度（BS.1770 / EBU R128）") }
         val zM = Loudness.blockZ(seg, h, 4)
         val zS = Loudness.blockZ(seg, h, 30)
         val integ = Loudness.integrated(zM)
@@ -214,6 +271,10 @@ object Analyzer {
         val tpMax = ampDb(tps.maxOrNull() ?: 0.0)
         val ld = Section("響度")
         ld.add("整合響度 I", Fmt.db(integ, "LUFS"))
+        if (nch > 2) {
+            val w = a.loudnessWeights
+            ld.add("聲道權重（BS.1770）", names.indices.joinToString("  ") { "${names[it]}×${Fmt.n(w[it], 2)}" })
+        }
         ld.add("響度範圍 LRA", if (lra.isFinite()) "${Fmt.n(lra, 1)} LU" else "—")
         ld.add("最大瞬時 M", Fmt.db(mMax, "LUFS"))
         ld.add("最大短期 S", Fmt.db(sMax, "LUFS"))
@@ -293,7 +354,7 @@ object Analyzer {
             val corr = if (ll > 0 && rrr > 0) lr / sqrt(ll * rrr) else Double.NaN
             val mm = (ll + 2 * lr + rrr) / 4
             val ss = (ll - 2 * lr + rrr) / 4
-            val st = Section("立體聲")
+            val st = Section(if (nch > 2) "立體聲（前左 / 前右）" else "立體聲")
             st.add("相位相關性", if (corr.isFinite()) Fmt.signed(corr, 3) else "—")
             st.add(
                 "單聲道相容性",
@@ -312,44 +373,26 @@ object Analyzer {
         // ── 頻譜（STFT，同時產生完整頻譜圖與音級分布）──
         progress(45, "計算頻譜")
         val nfft = if (sr > 96000) 8192 else 4096
-        val hop = max(nfft / 4, ceil(max(1, n - nfft) / 3000.0).toInt())
-        val nFrames = if (n <= nfft) 1 else 1 + (n - nfft) / hop
-        val fft = Fft(nfft)
-        val win = Windows.make("Hann", nfft)
-        val norm = 2.0 / win.sum()
         val bins = nfft / 2 + 1
         val binHz = sr.toDouble() / nfft
-        val buf = FloatArray(nfft)
-        val mag = FloatArray(bins)
         val pw = DoubleArray(bins)
-        val q = ByteArray(nFrames * bins)
         val pc = IntArray(bins) { k ->
             val f = k * binHz
             if (f in 55.0..5000.0) Math.floorMod((69 + 12 * log2(f / 440.0)).roundToInt(), 12) else -1
         }
         val chroma = DoubleArray(12)
         val cf = DoubleArray(12)
-        for (fr in 0 until nFrames) {
-            val s0 = fr * hop
-            for (i in 0 until nfft) {
-                val j = s0 + i
-                buf[i] = if (j < n) mono(j) * win[i] else 0f
-            }
-            fft.magnitude(buf, mag)
-            val base = fr * bins
+        val spec = spectrogram(a, 0, { p -> progress(45 + 25 * p / 100, "計算頻譜") }) { mag ->
             for (k in 0 until bins) {
                 val mv = mag[k].toDouble()
                 pw[k] += mv * mv
-                q[base + k] = SpecData.quant(20 * log10(mv * norm + 1e-10))
             }
             cf.fill(0.0)
             for (k in 0 until bins) if (pc[k] >= 0) cf[pc[k]] += mag[k].toDouble()
             val cm = cf.maxOrNull() ?: 0.0
             if (cm > 0) for (i in 0 until 12) chroma[i] += cf[i] / cm
-            if (fr % 64 == 0) progress(45 + 25 * fr / nFrames, "計算頻譜")
         }
-        for (k in 0 until bins) pw[k] /= nFrames
-        val spec = SpecData(q, nFrames, bins, binHz, hop.toDouble() / sr, nfft / 2.0 / sr, dur)
+        for (k in 0 until bins) pw[k] /= spec.frames
 
         val freqs = DoubleArray(bins) { it * binHz }
         var pTot = 0.0
@@ -442,7 +485,7 @@ object Analyzer {
             mu.add("次可能調性", "${scores[1].second}（相關 ${Fmt.n(scores[1].first, 2)}）")
             mu.add("音級分布", (0 until 12).joinToString("  ") { "${Notes.NAMES[it]}:${Fmt.n(chroma[it] / cmax, 2)}" })
         } else mu.add("調性", "無法估計")
-        val bpm = estimateBpm(chs, sr, n) { p -> progress(75 + p * 15 / 100, "估計速度") }
+        val bpm = estimateBpm(chs, sr, n, mixW) { p -> progress(75 + p * 15 / 100, "估計速度") }
         mu.add("速度", bpm?.let { "${Fmt.n(it.first, 1)} BPM（信心 ${Fmt.n(it.second, 2)}）" } ?: "無法估計")
         secs.add(mu)
 
@@ -450,7 +493,8 @@ object Analyzer {
         progress(92, "品質檢測")
         val qs = Section("品質檢測")
         qs.add("有損壓縮檢測", lossy)
-        val sb = meta.sourceBits
+        // 來源位元深度未知但以浮點解碼的無損檔，先假設 24 bit 再看實際用到幾位
+        val sb = meta.sourceBits ?: if (meta.lossless && meta.decodedBits >= 24) 24 else null
         if (sb != null && sb in 16..24 && meta.lossless && meta.decodedBits >= sb) {
             var or = 0L
             val total = n.toLong() * nch
@@ -464,7 +508,14 @@ object Analyzer {
             }
             if (or != 0L) {
                 val eff = sb - java.lang.Long.numberOfTrailingZeros(or)
-                qs.add("有效位元深度", "$eff bit" + if (eff < sb) "（⚠ 補零放大，實際內容較低）" else "")
+                qs.add(
+                    "有效位元深度",
+                    "$eff bit" + when {
+                        meta.sourceBits == null -> "（估計值，依樣本實際用到的位元）"
+                        eff < sb -> "（⚠ 補零放大，實際內容較低）"
+                        else -> ""
+                    },
+                )
             }
         }
         qs.add("削波", if (clipRuns.sum() > 0) "⚠ 有連續削波" else "未偵測到連續削波")
@@ -500,16 +551,17 @@ object Analyzer {
     }
 
     /** 頻譜通量起音包絡 + 自相關，偏好 120 BPM 附近。回傳 (BPM, 信心)。 */
-    fun estimateBpm(chs: Array<FloatArray>, sr: Int, n: Int, progress: (Int) -> Unit): Pair<Double, Double>? {
-        val nch = chs.size
+    fun estimateBpm(
+        chs: Array<FloatArray>, sr: Int, n: Int, mixW: FloatArray, progress: (Int) -> Unit,
+    ): Pair<Double, Double>? {
         val d = max(1, (sr / 11025.0).roundToInt())
         val fs2 = sr.toDouble() / d
         val len2 = min(n.toLong(), 240L * sr).toInt() / d
         if (len2 < 4096) return null
         val y = FloatArray(len2) { j ->
             var s = 0f
-            for (i in j * d until j * d + d) for (c in chs) s += c[i]
-            s / (d * nch)
+            for (i in j * d until j * d + d) for (c in chs.indices) s += chs[c][i] * mixW[c]
+            s / d
         }
         val nf = 1024
         val hop = 128

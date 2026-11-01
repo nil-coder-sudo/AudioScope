@@ -18,6 +18,9 @@ import android.os.Looper
 import android.provider.OpenableColumns
 import java.io.BufferedInputStream
 import java.io.EOFException
+import java.io.File
+import java.io.FileInputStream
+import java.io.FileOutputStream
 import java.io.InputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -31,20 +34,29 @@ interface SignalSource {
     val sampleRate: Int
     val channelCount: Int
 
-    /** 單調遞增的位置；沒變代表暫停中。 */
+    /** WAV 喇叭位元遮罩（決定聲道名稱與響度權重）。 */
+    val channelMask: Int
+
+    /** 取一個位置快照（單調遞增；沒變代表暫停中）。 */
     fun cursor(): Long
 
-    /** 把最新 n 個樣本寫進 out[c][0 until n]，不足的前段補 0。 */
+    /** 把「到上次 cursor() 快照為止」的最新 n 個樣本寫進 out[c][0 until n]，不足的前段補 0。 */
     fun latest(n: Int, out: Array<FloatArray>)
 }
 
 class FileSource(private val audio: DecodedAudio, private val player: Player) : SignalSource {
     override val sampleRate get() = audio.sampleRate
     override val channelCount get() = audio.channelCount
-    override fun cursor(): Long = player.position().toLong()
+    override val channelMask get() = audio.channelMask
+    private var snap = 0
+
+    override fun cursor(): Long {
+        snap = player.position()
+        return snap.toLong()
+    }
 
     override fun latest(n: Int, out: Array<FloatArray>) {
-        val end = player.position().coerceIn(0, audio.frames)
+        val end = snap.coerceIn(0, audio.frames)
         val start = end - n
         for (c in 0 until audio.channelCount) {
             val dst = out[c]
@@ -59,19 +71,11 @@ class FileSource(private val audio: DecodedAudio, private val player: Player) : 
 }
 
 // ════════════════════════════════════════════════════════════════════
-//  解碼：WAV 自己解析（保留真實位元深度），其他格式用 MediaCodec
+//  解碼：WAV 自己解析（保留真實位元深度與聲道遮罩），其他格式用 MediaCodec。
+//  MediaCodec 先要求浮點輸出（24-bit FLAC 不會被截成 16-bit），
+//  解碼結果先寫進暫存檔，知道確切長度後才配置陣列，記憶體峰值＝最終大小。
 // ════════════════════════════════════════════════════════════════════
 object AudioDecoder {
-    private class Grow(cap: Int) {
-        var a = FloatArray(max(cap, 4096))
-        var n = 0
-        fun add(v: Float) {
-            if (n == a.size) a = a.copyOf(a.size + a.size / 2 + 4096)
-            a[n++] = v
-        }
-        fun result(): FloatArray = if (n == a.size) a else a.copyOf(n)
-    }
-
     private val CODECS = mapOf(
         "audio/mpeg" to ("MP3（MPEG Layer III）" to false),
         "audio/mp4a-latm" to ("AAC" to false),
@@ -85,6 +89,21 @@ object AudioDecoder {
         "audio/ac3" to ("Dolby AC-3" to false),
         "audio/eac3" to ("Dolby E-AC-3" to false),
     )
+
+    /** 確認放得進記憶體；放不下就給看得懂的錯誤，而不是讓 App 閃退。 */
+    private fun ensureMemory(frames: Long, ch: Int, sr: Int) {
+        val need = frames * ch * 4L
+        val rt = Runtime.getRuntime()
+        val avail = rt.maxMemory() - (rt.totalMemory() - rt.freeMemory())
+        // 另外保留約 80 MB 給頻譜圖、點陣圖與介面
+        if (need > avail - 80L * 1024 * 1024) {
+            val maxMin = ((avail - 80L * 1024 * 1024).coerceAtLeast(0) / (4.0 * ch * sr) / 60)
+            throw IllegalStateException(
+                "檔案太長：${Fmt.n(frames.toDouble() / sr / 60, 1)} 分鐘、$ch 聲道需要約 ${Fmt.size(need)} 記憶體，" +
+                    "這台手機目前可用約 ${Fmt.size(avail)}（大約可處理 ${Fmt.n(maxMin, 0)} 分鐘）。",
+            )
+        }
+    }
 
     fun decode(ctx: Context, uri: Uri, progress: (Float) -> Unit): Pair<DecodedAudio, FileMeta> {
         var name = uri.lastPathSegment ?: "audio"
@@ -115,12 +134,12 @@ object AudioDecoder {
 
         if (isWav) {
             try {
-                val (audio, bits, isFloat) = ctx.contentResolver.openInputStream(uri)!!.use { readWav(it, size, progress) }
+                val w = ctx.contentResolver.openInputStream(uri)!!.use { readWav(it, size, progress) }
                 val meta = FileMeta(
                     name, size, "audio/wav",
-                    if (isFloat) "PCM 浮點（WAV）" else "PCM 整數（WAV）", true, 0, bits, bits, tags,
+                    if (w.isFloat) "PCM 浮點（WAV）" else "PCM 整數（WAV）", true, 0, w.validBits, w.containerBits, tags,
                 )
-                return audio to meta
+                return w.audio to meta
             } catch (e: UnsupportedOperationException) {
                 // 不支援的 WAV 子格式 → 交給 MediaCodec
             }
@@ -163,8 +182,12 @@ object AudioDecoder {
         return out
     }
 
+    private class WavResult(
+        val audio: DecodedAudio, val validBits: Int, val containerBits: Int, val isFloat: Boolean,
+    )
+
     // ── WAV（PCM 8/16/24/32、浮點 32/64、WAVE_FORMAT_EXTENSIBLE）──
-    private fun readWav(input: InputStream, fileSize: Long, progress: (Float) -> Unit): Triple<DecodedAudio, Int, Boolean> {
+    private fun readWav(input: InputStream, fileSize: Long, progress: (Float) -> Unit): WavResult {
         val s = BufferedInputStream(input, 1 shl 16)
         fun readFully(b: ByteArray, len: Int = b.size) {
             var r = 0
@@ -190,6 +213,8 @@ object AudioDecoder {
         var ch = 0
         var sr = 0
         var bits = 0
+        var validBits = 0
+        var mask = 0
         val ck = ByteArray(8)
         while (true) {
             readFully(ck)
@@ -203,7 +228,13 @@ object AudioDecoder {
                 ch = bb.getShort(2).toInt()
                 sr = bb.getInt(4)
                 bits = bb.getShort(14).toInt()
-                if (fmtTag == 0xFFFE && len >= 26) fmtTag = bb.getShort(24).toInt() and 0xffff
+                validBits = bits
+                if (fmtTag == 0xFFFE && len >= 26) {
+                    val vb = bb.getShort(18).toInt()
+                    if (vb in 1..bits) validBits = vb
+                    mask = bb.getInt(20)
+                    fmtTag = bb.getShort(24).toInt() and 0xffff
+                }
                 if (len % 2 == 1L) skip(1)
             } else if (id == "data") {
                 if (ch <= 0 || sr <= 0) throw UnsupportedOperationException()
@@ -213,6 +244,7 @@ object AudioDecoder {
                 var dataLen = len
                 if (dataLen == 0xffffffffL || dataLen == 0L) dataLen = if (fileSize > 0) fileSize - 44 else Long.MAX_VALUE
                 val frames = (dataLen / (bps * ch)).coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
+                ensureMemory(frames.toLong(), ch, sr)
                 val out = Array(ch) { FloatArray(frames) }
                 val chunkFrames = 8192
                 val buf = ByteArray(chunkFrames * bps * ch)
@@ -246,7 +278,7 @@ object AudioDecoder {
                     if (got < nf) break
                 }
                 val res = if (f0 < frames) Array(ch) { out[it].copyOf(f0) } else out
-                return Triple(DecodedAudio(sr, res), bits, isFloat)
+                return WavResult(DecodedAudio(sr, res, mask), if (isFloat) bits else validBits, bits, isFloat)
             } else {
                 skip(len + (len and 1L))
             }
@@ -259,103 +291,159 @@ object AudioDecoder {
         tags: List<Pair<String, String>>, progress: (Float) -> Unit,
     ): Pair<DecodedAudio, FileMeta> {
         val ex = MediaExtractor()
-        ex.setDataSource(ctx, uri, null)
-        var track = -1
-        var fmt: MediaFormat? = null
-        for (i in 0 until ex.trackCount) {
-            val f = ex.getTrackFormat(i)
-            if (f.getString(MediaFormat.KEY_MIME)?.startsWith("audio/") == true) {
-                track = i
-                fmt = f
-                break
-            }
-        }
-        if (track < 0 || fmt == null) {
-            ex.release()
-            throw IllegalArgumentException("這個檔案裡找不到音訊軌")
-        }
-        ex.selectTrack(track)
-        val mime = fmt.getString(MediaFormat.KEY_MIME)!!
-        var sr = fmt.getInteger(MediaFormat.KEY_SAMPLE_RATE)
-        var ch = fmt.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
-        val durUs = if (fmt.containsKey(MediaFormat.KEY_DURATION)) fmt.getLong(MediaFormat.KEY_DURATION) else 0L
-        val bitrate = if (fmt.containsKey(MediaFormat.KEY_BIT_RATE)) fmt.getInteger(MediaFormat.KEY_BIT_RATE) else 0
-        var srcBits: Int? = when {
-            fmt.containsKey("bits-per-sample") -> fmt.getInteger("bits-per-sample")
-            fmt.containsKey(MediaFormat.KEY_PCM_ENCODING) -> encBits(fmt.getInteger(MediaFormat.KEY_PCM_ENCODING))
-            else -> null
-        }
-        val codec = MediaCodec.createDecoderByType(mime)
-        codec.configure(fmt, null, null, 0)
-        codec.start()
-        val info = MediaCodec.BufferInfo()
-        var outEnc = AudioFormat.ENCODING_PCM_16BIT
-        val est = if (durUs > 0) (durUs * sr / 1_000_000L + sr).toInt() else sr * 60
-        var bufs = Array(ch) { Grow(est) }
-        var inDone = false
-        var outDone = false
-        var idle = 0
-        var lastP = -1
+        val tmp = File.createTempFile("decode", ".f32", ctx.cacheDir)
+        var codec: MediaCodec? = null
         try {
-            while (!outDone) {
-                if (!inDone) {
-                    val ii = codec.dequeueInputBuffer(10_000)
-                    if (ii >= 0) {
-                        val ib = codec.getInputBuffer(ii)!!
-                        val n = ex.readSampleData(ib, 0)
-                        if (n < 0) {
-                            codec.queueInputBuffer(ii, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
-                            inDone = true
-                        } else {
-                            codec.queueInputBuffer(ii, 0, n, ex.sampleTime, 0)
-                            ex.advance()
-                            if (durUs > 0) {
-                                val p = (ex.sampleTime * 100 / durUs).toInt()
-                                if (p != lastP) {
-                                    lastP = p
-                                    progress(p / 100f)
+            ex.setDataSource(ctx, uri, null)
+            var track = -1
+            var fmt: MediaFormat? = null
+            for (i in 0 until ex.trackCount) {
+                val f = ex.getTrackFormat(i)
+                if (f.getString(MediaFormat.KEY_MIME)?.startsWith("audio/") == true) {
+                    track = i
+                    fmt = f
+                    break
+                }
+            }
+            if (track < 0 || fmt == null) throw IllegalArgumentException("這個檔案裡找不到音訊軌")
+            ex.selectTrack(track)
+            val mime = fmt.getString(MediaFormat.KEY_MIME)!!
+            var sr = fmt.getInteger(MediaFormat.KEY_SAMPLE_RATE)
+            var ch = fmt.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
+            var outMask = if (fmt.containsKey(MediaFormat.KEY_CHANNEL_MASK)) fmt.getInteger(MediaFormat.KEY_CHANNEL_MASK) else 0
+            val durUs = if (fmt.containsKey(MediaFormat.KEY_DURATION)) fmt.getLong(MediaFormat.KEY_DURATION) else 0L
+            val bitrate = if (fmt.containsKey(MediaFormat.KEY_BIT_RATE)) fmt.getInteger(MediaFormat.KEY_BIT_RATE) else 0
+            var srcBits: Int? = when {
+                fmt.containsKey("bits-per-sample") -> fmt.getInteger("bits-per-sample")
+                fmt.containsKey(MediaFormat.KEY_PCM_ENCODING) -> encBits(fmt.getInteger(MediaFormat.KEY_PCM_ENCODING))
+                else -> null
+            }
+
+            // 先要求浮點輸出；不支援的解碼器就退回預設（通常是 16-bit）
+            codec = MediaCodec.createDecoderByType(mime)
+            try {
+                fmt.setInteger(MediaFormat.KEY_PCM_ENCODING, AudioFormat.ENCODING_PCM_FLOAT)
+                codec.configure(fmt, null, null, 0)
+            } catch (e: Exception) {
+                codec.release()
+                fmt.removeKey(MediaFormat.KEY_PCM_ENCODING)
+                codec = MediaCodec.createDecoderByType(mime)
+                codec.configure(fmt, null, null, 0)
+            }
+            val dec = codec!!
+            dec.start()
+            var outEnc = AudioFormat.ENCODING_PCM_16BIT
+            try {
+                val of = dec.outputFormat
+                if (of.containsKey(MediaFormat.KEY_PCM_ENCODING)) outEnc = of.getInteger(MediaFormat.KEY_PCM_ENCODING)
+            } catch (_: Exception) {
+            }
+            val info = MediaCodec.BufferInfo()
+            val fc = FileOutputStream(tmp).channel
+            val stage = ByteBuffer.allocateDirect(1 shl 18).order(ByteOrder.LITTLE_ENDIAN)
+            var samples = 0L
+            var inDone = false
+            var outDone = false
+            var idle = 0
+            var lastP = -1
+            fun flush() {
+                stage.flip()
+                while (stage.hasRemaining()) fc.write(stage)
+                stage.clear()
+            }
+            fc.use {
+                while (!outDone) {
+                    if (!inDone) {
+                        val ii = dec.dequeueInputBuffer(10_000)
+                        if (ii >= 0) {
+                            val ib = dec.getInputBuffer(ii)!!
+                            val n = ex.readSampleData(ib, 0)
+                            if (n < 0) {
+                                dec.queueInputBuffer(ii, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+                                inDone = true
+                            } else {
+                                dec.queueInputBuffer(ii, 0, n, ex.sampleTime, 0)
+                                ex.advance()
+                                if (durUs > 0) {
+                                    val p = (ex.sampleTime * 100 / durUs).toInt()
+                                    if (p != lastP) {
+                                        lastP = p
+                                        progress(p / 100f)
+                                    }
                                 }
                             }
                         }
                     }
-                }
-                val oi = codec.dequeueOutputBuffer(info, 10_000)
-                if (oi >= 0) {
-                    idle = 0
-                    val ob = codec.getOutputBuffer(oi)
-                    if (ob != null && info.size > 0) {
-                        ob.position(info.offset)
-                        ob.limit(info.offset + info.size)
-                        append(ob.slice(), outEnc, ch, bufs)
+                    val oi = dec.dequeueOutputBuffer(info, 10_000)
+                    if (oi >= 0) {
+                        idle = 0
+                        val ob = dec.getOutputBuffer(oi)
+                        if (ob != null && info.size > 0) {
+                            ob.position(info.offset)
+                            ob.limit(info.offset + info.size)
+                            samples += writeFloats(ob.slice().order(ByteOrder.LITTLE_ENDIAN), outEnc, stage, ::flush)
+                        }
+                        dec.releaseOutputBuffer(oi, false)
+                        if (info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) outDone = true
+                    } else if (oi == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                        val of = dec.outputFormat
+                        sr = of.getInteger(MediaFormat.KEY_SAMPLE_RATE)
+                        val nch = of.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
+                        if (of.containsKey(MediaFormat.KEY_PCM_ENCODING)) outEnc = of.getInteger(MediaFormat.KEY_PCM_ENCODING)
+                        if (of.containsKey(MediaFormat.KEY_CHANNEL_MASK)) outMask = of.getInteger(MediaFormat.KEY_CHANNEL_MASK)
+                        if (samples == 0L) ch = nch
+                    } else if (inDone && ++idle > 300) {
+                        break // 解碼器沒送出結束旗標，避免卡死
                     }
-                    codec.releaseOutputBuffer(oi, false)
-                    if (info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) outDone = true
-                } else if (oi == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
-                    val of = codec.outputFormat
-                    sr = of.getInteger(MediaFormat.KEY_SAMPLE_RATE)
-                    val nch = of.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
-                    if (of.containsKey(MediaFormat.KEY_PCM_ENCODING)) outEnc = of.getInteger(MediaFormat.KEY_PCM_ENCODING)
-                    if (nch != ch && bufs[0].n == 0) {
-                        ch = nch
-                        bufs = Array(ch) { Grow(est) }
-                    }
-                } else if (inDone && ++idle > 300) {
-                    break // 解碼器沒送出結束旗標，避免卡死
                 }
+                flush()
             }
-        } finally {
             try {
-                codec.stop()
+                dec.stop()
             } catch (_: Exception) {
             }
-            codec.release()
+            dec.release()
+            codec = null
+
+            val frames = samples / ch
+            if (frames <= 0) throw IllegalStateException("解碼後沒有任何音訊資料")
+            if (frames > Int.MAX_VALUE) throw IllegalStateException("檔案太長")
+            ensureMemory(frames, ch, sr)
+            val out = Array(ch) { FloatArray(frames.toInt()) }
+            FileInputStream(tmp).channel.use { rc ->
+                val rb = ByteBuffer.allocateDirect(ch * 4 * 16384).order(ByteOrder.LITTLE_ENDIAN)
+                var f = 0
+                while (f < frames) {
+                    rb.clear()
+                    val want = min(rb.capacity().toLong(), (frames - f) * ch * 4L).toInt()
+                    rb.limit(want)
+                    while (rb.hasRemaining()) if (rc.read(rb) < 0) break
+                    rb.flip()
+                    val fb = rb.asFloatBuffer()
+                    val got = fb.remaining() / ch
+                    for (i in 0 until got) for (c in 0 until ch) out[c][f + i] = fb.get()
+                    f += got
+                    if (got == 0) break
+                }
+            }
+            val (codecName, lossless) = CODECS[mime] ?: (mime.removePrefix("audio/").uppercase() to false)
+            if (!lossless) srcBits = null
+            val decodedBits = encBits(outEnc)
+            // Android 的 CHANNEL_OUT_* 遮罩＝WAV 喇叭位元左移 2 位
+            val wavMask = if (outMask > 0) (outMask ushr 2) and 0x3FFFF else 0
+            val meta = FileMeta(name, size, mime, codecName, lossless, bitrate, srcBits, decodedBits, tags)
+            return DecodedAudio(sr, out, wavMask) to meta
+        } finally {
+            codec?.let {
+                try {
+                    it.stop()
+                } catch (_: Exception) {
+                }
+                it.release()
+            }
             ex.release()
+            tmp.delete()
         }
-        if (bufs[0].n == 0) throw IllegalStateException("解碼後沒有任何音訊資料")
-        val (codecName, lossless) = CODECS[mime] ?: (mime.removePrefix("audio/").uppercase() to false)
-        if (!lossless) srcBits = null
-        val meta = FileMeta(name, size, mime, codecName, lossless, bitrate, srcBits, encBits(outEnc), tags)
-        return DecodedAudio(sr, Array(ch) { bufs[it].result() }) to meta
     }
 
     private fun encBits(enc: Int): Int = when (enc) {
@@ -366,43 +454,48 @@ object AudioDecoder {
         else -> 16
     }
 
-    private fun append(bb: ByteBuffer, enc: Int, ch: Int, out: Array<Grow>) {
-        bb.order(ByteOrder.LITTLE_ENDIAN)
+    /** 把解碼器輸出轉成 float32 寫進 stage，回傳寫入的樣本數（所有聲道合計）。 */
+    private fun writeFloats(bb: ByteBuffer, enc: Int, stage: ByteBuffer, flush: () -> Unit): Long {
+        var n = 0L
+        fun put(v: Float) {
+            if (stage.remaining() < 4) flush()
+            stage.putFloat(v)
+            n++
+        }
         when (enc) {
             AudioFormat.ENCODING_PCM_FLOAT -> {
-                val fb = bb.asFloatBuffer()
-                val frames = fb.remaining() / ch
-                for (i in 0 until frames) for (c in 0 until ch) out[c].add(fb.get())
-            }
-            AudioFormat.ENCODING_PCM_8BIT -> {
-                val frames = bb.remaining() / ch
-                for (i in 0 until frames) for (c in 0 until ch) out[c].add(((bb.get().toInt() and 0xff) - 128) / 128f)
-            }
-            21 -> {
-                val frames = bb.remaining() / (3 * ch)
-                for (i in 0 until frames) for (c in 0 until ch) {
-                    val b0 = bb.get().toInt() and 0xff
-                    val b1 = bb.get().toInt() and 0xff
-                    val b2 = bb.get().toInt()
-                    out[c].add(((b2 shl 16) or (b1 shl 8) or b0) / 8388608f)
+                // 已是 float32 LE：整塊複製
+                n = (bb.remaining() / 4).toLong()
+                while (bb.hasRemaining()) {
+                    if (!stage.hasRemaining()) flush()
+                    val k = min(stage.remaining(), bb.remaining()) and 3.inv()
+                    if (k == 0) {
+                        flush()
+                        continue
+                    }
+                    val lim = bb.limit()
+                    bb.limit(bb.position() + k)
+                    stage.put(bb)
+                    bb.limit(lim)
                 }
             }
-            22 -> {
-                val ib = bb.asIntBuffer()
-                val frames = ib.remaining() / ch
-                for (i in 0 until frames) for (c in 0 until ch) out[c].add((ib.get() / 2147483648.0).toFloat())
+            AudioFormat.ENCODING_PCM_8BIT -> while (bb.hasRemaining()) put(((bb.get().toInt() and 0xff) - 128) / 128f)
+            21 -> while (bb.remaining() >= 3) {
+                val b0 = bb.get().toInt() and 0xff
+                val b1 = bb.get().toInt() and 0xff
+                val b2 = bb.get().toInt()
+                put(((b2 shl 16) or (b1 shl 8) or b0) / 8388608f)
             }
-            else -> {
-                val sb = bb.asShortBuffer()
-                val frames = sb.remaining() / ch
-                for (i in 0 until frames) for (c in 0 until ch) out[c].add(sb.get() / 32768f)
-            }
+            22 -> while (bb.remaining() >= 4) put((bb.int / 2147483648.0).toFloat())
+            else -> while (bb.remaining() >= 2) put(bb.short / 32768f)
         }
+        return n
     }
 }
 
 // ════════════════════════════════════════════════════════════════════
-//  播放：AudioTrack 串流，位置由播放頭回報（畫面與聲音同步）
+//  播放：AudioTrack 串流，位置由播放頭回報（畫面與聲音同步）。
+//  多聲道檔案用原始聲道配置輸出（系統負責縮混）；不支援時自行縮混成立體聲。
 // ════════════════════════════════════════════════════════════════════
 class Player(private val audio: DecodedAudio, private val onEnded: () -> Unit) {
     private val main = Handler(Looper.getMainLooper())
@@ -415,18 +508,17 @@ class Player(private val audio: DecodedAudio, private val onEnded: () -> Unit) {
     private var startFrame = 0
     private var pausedFrame = 0
     private var session = 0
-    private val outCh = min(2, audio.channelCount)
+    private var outCh = 2
+    private var downmix: Array<FloatArray>? = null
+    var outputDescription = ""
+        private set
 
     fun position(): Int {
         val t = track
         return if (playing && t != null) min(audio.frames, startFrame + t.playbackHeadPosition) else pausedFrame
     }
 
-    fun play() {
-        if (playing) return
-        if (pausedFrame >= audio.frames - 1) pausedFrame = 0
-        startFrame = pausedFrame
-        val mask = if (outCh == 1) AudioFormat.CHANNEL_OUT_MONO else AudioFormat.CHANNEL_OUT_STEREO
+    private fun build(mask: Int, ch: Int): AudioTrack? = try {
         val minBuf = AudioTrack.getMinBufferSize(audio.sampleRate, mask, AudioFormat.ENCODING_PCM_FLOAT)
         val t = AudioTrack.Builder()
             .setAudioAttributes(
@@ -442,9 +534,50 @@ class Player(private val audio: DecodedAudio, private val onEnded: () -> Unit) {
                     .setChannelMask(mask)
                     .build(),
             )
-            .setBufferSizeInBytes(max(minBuf, 4096 * outCh * 4))
+            .setBufferSizeInBytes(max(minBuf, 4096 * ch * 4))
             .setTransferMode(AudioTrack.MODE_STREAM)
             .build()
+        if (t.state == AudioTrack.STATE_INITIALIZED) t else {
+            t.release()
+            null
+        }
+    } catch (_: Exception) {
+        null
+    }
+
+    private fun createTrack(): AudioTrack {
+        val ch = audio.channelCount
+        if (ch == 1) {
+            outCh = 1
+            downmix = null
+            outputDescription = "單聲道"
+            return build(AudioFormat.CHANNEL_OUT_MONO, 1) ?: throw IllegalStateException("無法建立音訊輸出")
+        }
+        if (ch > 2) {
+            val m = audio.channelMask
+            if (m in 1..0x7FF) {
+                build(m shl 2, ch)?.let {
+                    outCh = ch
+                    downmix = null
+                    outputDescription = "$ch 聲道（系統縮混）"
+                    return it
+                }
+            }
+            downmix = Layout.stereoDownmix(ch, m)
+            outputDescription = "$ch → 2 聲道縮混"
+        } else {
+            downmix = null
+            outputDescription = "立體聲"
+        }
+        outCh = 2
+        return build(AudioFormat.CHANNEL_OUT_STEREO, 2) ?: throw IllegalStateException("無法建立音訊輸出")
+    }
+
+    fun play() {
+        if (playing) return
+        if (pausedFrame >= audio.frames - 1) pausedFrame = 0
+        startFrame = pausedFrame
+        val t = createTrack()
         track = t
         stopReq = false
         playing = true
@@ -459,17 +592,34 @@ class Player(private val audio: DecodedAudio, private val onEnded: () -> Unit) {
 
     private fun writeLoop(t: AudioTrack, my: Int, from: Int) {
         val chunk = 2048
-        val buf = FloatArray(chunk * outCh)
+        val oc = outCh
+        val buf = FloatArray(chunk * oc)
         var pos = from
         val chs = audio.channels
+        val nch = chs.size
+        val mtx = downmix
         try {
             while (!stopReq && pos < audio.frames) {
                 val n = min(chunk, audio.frames - pos)
                 val v = volume
                 var k = 0
-                for (i in 0 until n) for (c in 0 until outCh) buf[k++] = chs[c][pos + i] * v
+                if (mtx == null) {
+                    for (i in 0 until n) for (c in 0 until oc) buf[k++] = chs[c][pos + i] * v
+                } else {
+                    for (i in 0 until n) {
+                        var l = 0f
+                        var r = 0f
+                        for (c in 0 until nch) {
+                            val x = chs[c][pos + i]
+                            l += x * mtx[c][0]
+                            r += x * mtx[c][1]
+                        }
+                        buf[k++] = l * v
+                        buf[k++] = r * v
+                    }
+                }
                 var off = 0
-                val total = n * outCh
+                val total = n * oc
                 while (off < total && !stopReq) {
                     val w = t.write(buf, off, total - off, AudioTrack.WRITE_NON_BLOCKING)
                     if (w < 0) {
@@ -550,6 +700,7 @@ class LiveInput : SignalSource {
         private set
     override var channelCount = 1
         private set
+    override val channelMask: Int get() = Layout.defaultMask(channelCount)
     var sourceName = ""
         private set
     private var rec: AudioRecord? = null
@@ -638,16 +789,24 @@ class LiveInput : SignalSource {
         rec = null
     }
 
-    override fun cursor(): Long = synchronized(lock) { total }
+    private var snap = 0L
+
+    override fun cursor(): Long = synchronized(lock) {
+        snap = total
+        total
+    }
 
     override fun latest(n: Int, out: Array<FloatArray>) {
         synchronized(lock) {
-            val m = min(n, size)
+            // 快照之後又寫進來的樣本不算，讓 cursor 與資料一致
+            val ahead = (total - snap).coerceIn(0, size.toLong()).toInt()
+            val m = min(n, size - ahead)
             val pad = n - m
+            val endW = Math.floorMod(w - ahead, size)
             for (c in 0 until channelCount) {
                 val dst = out[c]
                 if (pad > 0) java.util.Arrays.fill(dst, 0, pad, 0f)
-                var s = w - m
+                var s = endW - m
                 if (s < 0) s += size
                 val first = min(m, size - s)
                 System.arraycopy(ring[c], s, dst, pad, first)

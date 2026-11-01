@@ -31,6 +31,7 @@ import android.widget.SeekBar
 import android.widget.Spinner
 import android.widget.TextView
 import android.widget.Toast
+import java.util.concurrent.CancellationException
 import kotlin.math.abs
 import kotlin.math.log10
 import kotlin.math.max
@@ -68,6 +69,7 @@ class MainActivity : Activity() {
     private lateinit var specView: SpectrogramView
     private lateinit var specRead: TextView
     private lateinit var specScaleBtn: Button
+    private lateinit var specChBtn: Button
     private lateinit var seekLo: SeekBar
     private lateinit var seekHi: SeekBar
     private lateinit var loLabel: TextView
@@ -86,6 +88,10 @@ class MainActivity : Activity() {
     private var sections: List<Section> = emptyList()
     private var gen = 0
     private var running = false
+    private var worker: Thread? = null
+    private val specCache = HashMap<Int, SpecData>()
+    private var specMode = 0
+    private var specJob = 0
 
     // ── 設定 ──
     private var fftSize = 8192
@@ -117,8 +123,9 @@ class MainActivity : Activity() {
     private var corrS = 1f
     private var lufsM = Double.NEGATIVE_INFINITY
     private var lufsS = Double.NEGATIVE_INFINITY
-    private val liveZ = ArrayList<Double>()
-    private var lastZt = 0L
+    private var loud: LoudnessMeter? = null
+    private var loudKey = ""
+    private var mixW = floatArrayOf(0.5f, 0.5f)
     private var peakFreq = -1.0
     private var peakNote = "—"
 
@@ -314,6 +321,8 @@ class MainActivity : Activity() {
             specScaleBtn.text = if (specView.logScale) "刻度：對數" else "刻度：線性"
         }
         r1.addView(specScaleBtn, lp(WRAP, WRAP).apply { marginEnd = dpi(6) })
+        specChBtn = btn("聲道：混合") { nextSpecMode() }
+        r1.addView(specChBtn, lp(WRAP, WRAP).apply { marginEnd = dpi(6) })
         r1.addView(btn("自動對比") { autoContrast() }, lp(WRAP, WRAP))
         specRead = tv("", 11f, Color.WHITE, mono = true).apply {
             gravity = Gravity.END
@@ -434,25 +443,38 @@ class MainActivity : Activity() {
         source = null
         audio = null
         result = null
-        val g = ++gen
+        specCache.clear()
+        specMode = 0
+        specChBtn.text = "聲道：混合"
+        val g = ++gen // 舊的解碼／分析工作看到 gen 變了就會自行中止
         statusText.text = "解碼中…"
         infoStatus.text = "解碼中…"
         specView.setSpec(null)
         specView.setHint("解碼中…")
         updateButtons()
-        Thread {
+        val prev = worker
+        val t = Thread {
+            fun check() {
+                if (g != gen) throw CancellationException()
+            }
             try {
+                // 等上一首的工作真的結束，確保記憶體裡不會同時有兩首歌
+                prev?.join()
+                check()
                 var lastPct = -1
                 val (a, m) = AudioDecoder.decode(this, uri) { p ->
+                    check()
                     val pct = (p * 100).toInt()
                     if (pct != lastPct) {
                         lastPct = pct
                         ui.post { if (g == gen) statusText.text = "解碼中 $pct%" }
                     }
                 }
+                check()
                 val env = Analyzer.envelope(a)
                 ui.post { if (g == gen) onDecoded(a, m, env) }
                 val res = Analyzer.run(a, m) { pct, msg ->
+                    check()
                     ui.post {
                         if (g == gen) {
                             infoStatus.text = "分析中 $pct%：$msg"
@@ -461,10 +483,49 @@ class MainActivity : Activity() {
                     }
                 }
                 ui.post { if (g == gen) onAnalyzed(res) }
+            } catch (_: CancellationException) {
+            } catch (_: InterruptedException) {
             } catch (e: OutOfMemoryError) {
-                ui.post { if (g == gen) showError("檔案太大，記憶體不足。可試試較短的檔案。") }
+                ui.post { if (g == gen) showError("記憶體不足，這個檔案太大了。可以試試較短的檔案。") }
             } catch (e: Exception) {
                 ui.post { if (g == gen) showError(e.message ?: e.javaClass.simpleName) }
+            }
+        }
+        worker = t
+        t.start()
+    }
+
+    /** 頻譜圖分頁切換聲道：混合 → L → R → Side。算過的會快取。 */
+    private fun nextSpecMode() {
+        val a = audio ?: return toast("請先開啟音檔")
+        if (result == null) return toast("請等分析完成")
+        if (a.channelCount < 2) return toast("單聲道檔案只有一個聲道")
+        val mode = (specMode + 1) % Analyzer.SPEC_MODES.size
+        specMode = mode
+        specChBtn.text = "聲道：${Analyzer.SPEC_MODES[mode]}"
+        specCache[mode]?.let {
+            specView.setSpec(it, keepView = true)
+            return
+        }
+        val g = gen
+        val job = ++specJob
+        specRead.text = "計算 ${Analyzer.SPEC_MODES[mode]} 頻譜圖…"
+        Thread {
+            try {
+                val sp = Analyzer.spectrogram(a, mode, { pct ->
+                    if (g != gen || job != specJob) throw CancellationException()
+                    if (pct % 10 == 0) ui.post { if (job == specJob) specRead.text = "計算中 $pct%" }
+                })
+                ui.post {
+                    if (g == gen) specCache[mode] = sp
+                    if (g == gen && job == specJob) {
+                        specView.setSpec(sp, keepView = true)
+                        specRead.text = ""
+                    }
+                }
+            } catch (_: CancellationException) {
+            } catch (_: OutOfMemoryError) {
+                ui.post { toast("記憶體不足，無法計算這個聲道") }
             }
         }.start()
     }
@@ -493,8 +554,9 @@ class MainActivity : Activity() {
         infoStatus.text = "分析完成"
         rd["I"]?.text = Fmt.db(r.integrated, "LUFS", 1)
         rd["TP"]?.text = Fmt.db(r.truePeakDb, "dBTP", 1)
+        specCache[0] = r.spec
         specView.setColormap(cmap)
-        specView.setSpec(r.spec)
+        if (specMode == 0) specView.setSpec(r.spec)
         autoContrast()
     }
 
@@ -612,7 +674,8 @@ class MainActivity : Activity() {
         if (!li.start(this)) return toast("無法開啟麥克風")
         live = li
         source = li
-        liveZ.clear()
+        loud = null
+        loudKey = ""
         lufsM = Double.NEGATIVE_INFINITY
         lufsS = Double.NEGATIVE_INFINITY
         applyDsp()
@@ -741,6 +804,15 @@ class MainActivity : Activity() {
         mRms = FloatArray(ch) { -120f }
         holdT = LongArray(ch)
         lastCur = Long.MIN_VALUE
+        val mask = source?.channelMask ?: Layout.defaultMask(ch)
+        mixW = Layout.mixWeights(ch, mask)
+        // 取樣率／聲道不變時保留響度表（例如只改了 FFT 設定），麥克風的整合響度才不會歸零
+        val key = "$sr|$ch|$mask|${System.identityHashCode(source)}"
+        if (key != loudKey || loud == null) {
+            loud = LoudnessMeter(sr, Layout.loudnessWeights(ch, mask))
+            loudKey = key
+        }
+        meter.layoutParams = meter.layoutParams.apply { height = if (ch <= 2) dpi(56) else dpi(16 + 18 * min(ch, 8)) }
         spectrum.apply {
             sampleRate = sr
             logScale = this@MainActivity.logScale
@@ -774,8 +846,8 @@ class MainActivity : Activity() {
             4 -> (l - r) * 0.5f
             else -> {
                 var s = 0f
-                for (c in b) s += c[i]
-                s / b.size
+                for (c in b.indices) s += b[c][i] * mixW[c]
+                s
             }
         }
     }
@@ -796,6 +868,7 @@ class MainActivity : Activity() {
             timeText.text = "● LIVE ${Fmt.n(sr / 1000.0, 1)} kHz"
         }
         val cur = src.cursor()
+        val delta = if (lastCur == Long.MIN_VALUE) -1L else cur - lastCur
         lastCur = cur
         // 播放位置／收音計數是一塊一塊更新的（約 10–40 ms），比螢幕刷新慢，
         // 所以用「正在播放或收音」判斷是否在跑，而不是看這一格位置有沒有變。
@@ -852,18 +925,20 @@ class MainActivity : Activity() {
                 holdT[c] = now
             } else if (now - holdT[c] > 1_500_000_000L) mHold[c] -= 20f * dt
         }
-        meter.set(Analyzer.channelNames(ch), mPeak, mRms, mHold)
+        meter.set(Layout.names(ch, src.channelMask), mPeak, mRms, mHold)
 
-        // 響度（每 3 格算一次）
-        if (advanced && frameNo % 3 == 0L) {
-            val len = min(need, 3 * sr)
-            val z = Loudness.liveZ(blk, len, sr, (0.4 * sr).toInt())
-            lufsM = Loudness.lufs(z[0])
-            lufsS = Loudness.lufs(z[1])
-            if (src === live && now - lastZt >= 100_000_000L) {
-                lastZt = now
-                liveZ.add(z[0])
+        // 響度：串流式，濾波器狀態持續保留，每格只處理新進來的樣本
+        val lm = loud
+        if (lm != null) {
+            if (delta < 0 || delta > need) {
+                // 剛開始、跳轉或卡頓太久：重設濾波器並用最近 3 秒預熱
+                lm.reset(clearIntegrated = src !== live)
+                lm.push(blk, 0, need)
+            } else if (delta > 0) {
+                lm.push(blk, need - delta.toInt(), delta.toInt())
             }
+            lufsM = lm.momentary()
+            lufsS = lm.shortTerm()
         }
 
         // 立體聲
@@ -891,7 +966,7 @@ class MainActivity : Activity() {
             rd["note"]?.text = if (peakFreq > 0) peakNote else "—"
             rd["M"]?.text = Fmt.db(if (lufsM > -70) lufsM else Double.NEGATIVE_INFINITY, "LUFS", 1)
             rd["S"]?.text = Fmt.db(if (lufsS > -70) lufsS else Double.NEGATIVE_INFINITY, "LUFS", 1)
-            if (src === live && liveZ.isNotEmpty()) rd["I"]?.text = Fmt.db(Loudness.integrated(liveZ), "LUFS", 1)
+            if (src === live && lm != null) rd["I"]?.text = Fmt.db(lm.integrated(), "LUFS", 1)
         }
     }
 }
